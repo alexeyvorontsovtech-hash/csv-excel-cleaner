@@ -6,10 +6,12 @@
 возврата и текста ошибок.
 """
 
+import json
 import subprocess
 import sys
 from pathlib import Path
 
+import openpyxl
 import pandas as pd
 import pytest
 
@@ -107,16 +109,34 @@ def test_trim_whitespace_with_pandas_string_dtype():
 ])
 def test_normalize_dates_known_formats(raw, expected):
     df = pd.DataFrame({"date": [raw]})
-    result, changed, columns = clean_data.normalize_dates(df, columns=["date"])
+    result, changed, invalid, columns = clean_data.normalize_dates(df, columns=["date"])
     assert result["date"].iloc[0] == expected
     assert columns == ["date"]
+    assert invalid == 0
 
 
 def test_normalize_dates_non_date_value_unchanged():
     df = pd.DataFrame({"date": ["не дата"]})
-    result, changed, columns = clean_data.normalize_dates(df, columns=["date"])
+    result, changed, invalid, columns = clean_data.normalize_dates(df, columns=["date"])
     assert result["date"].iloc[0] == "не дата"
     assert changed == 0
+    assert invalid == 0
+
+
+def test_normalize_dates_datetime_with_time_supported():
+    df = pd.DataFrame({"date": ["2024-03-06 10:15:00"]})
+    result, changed, invalid, columns = clean_data.normalize_dates(df, columns=["date"])
+    assert result["date"].iloc[0] == "06.03.2024 10:15:00"
+    assert changed == 1
+    assert invalid == 0
+
+
+def test_normalize_dates_invalid_date_unchanged_but_counted():
+    df = pd.DataFrame({"date": ["31.02.2024"]})
+    result, changed, invalid, columns = clean_data.normalize_dates(df, columns=["date"])
+    assert result["date"].iloc[0] == "31.02.2024"
+    assert changed == 0
+    assert invalid == 1
 
 
 # =====================================================================
@@ -130,15 +150,268 @@ def test_normalize_dates_non_date_value_unchanged():
 ])
 def test_normalize_numbers_known_formats(raw, expected):
     df = pd.DataFrame({"amount": [raw]})
-    result, changed, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    result, changed, unrecognized, columns = clean_data.normalize_numbers(df, columns=["amount"])
     assert result["amount"].iloc[0] == expected
 
 
 def test_normalize_numbers_non_numeric_value_unchanged():
     df = pd.DataFrame({"amount": ["не число"]})
-    result, changed, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    result, changed, unrecognized, columns = clean_data.normalize_numbers(df, columns=["amount"])
     assert result["amount"].iloc[0] == "не число"
     assert changed == 0
+    assert unrecognized == 0
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("1.234,56", "1234.56"),
+    ("0,125", "0.125"),
+    ("-1 200,50", "-1200.50"),
+    ("2 500 руб.", "2500"),
+])
+def test_normalize_numbers_new_cases(raw, expected):
+    df = pd.DataFrame({"amount": [raw]})
+    result, changed, unrecognized, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    assert result["amount"].iloc[0] == expected
+    assert unrecognized == 0
+
+
+def test_normalize_numbers_does_not_round_to_two_decimals():
+    df = pd.DataFrame({"amount": ["0,125"]})
+    result, changed, unrecognized, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    assert result["amount"].iloc[0] == "0.125"
+
+
+def test_normalize_numbers_ambiguous_comma_is_not_changed():
+    """Ровно 3 цифры после единственной запятой при непустой ненулевой
+    целой части — неоднозначный случай (тысячи или десятичная часть?).
+    Значение не меняется, но учитывается в unrecognized_count."""
+    df = pd.DataFrame({"amount": ["1,234"]})
+    result, changed, unrecognized, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    assert result["amount"].iloc[0] == "1,234"
+    assert changed == 0
+    assert unrecognized == 1
+
+
+def test_normalize_numbers_leading_zero_comma_is_not_ambiguous():
+    """"0,125" не может быть тысячами (0125 не бывает), поэтому это
+    однозначно десятичная запятая, а не неоднозначный случай."""
+    df = pd.DataFrame({"amount": ["0,125"]})
+    result, changed, unrecognized, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    assert unrecognized == 0
+    assert changed == 1
+
+
+# =====================================================================
+# coerce_numeric_columns
+# =====================================================================
+
+def test_coerce_numeric_columns_converts_strings_to_numbers():
+    df = pd.DataFrame({"amount": ["1200.50", "2500"]})
+    result = clean_data.coerce_numeric_columns(df, ["amount"])
+    assert result["amount"].iloc[0] == pytest.approx(1200.50)
+    assert isinstance(result["amount"].iloc[0], float)
+    assert result["amount"].iloc[1] == 2500
+    assert isinstance(result["amount"].iloc[1], int)
+
+
+def test_coerce_numeric_columns_keeps_unrecognized_values_untouched():
+    df = pd.DataFrame({"amount": ["не число"]})
+    result = clean_data.coerce_numeric_columns(df, ["amount"])
+    assert result["amount"].iloc[0] == "не число"
+
+
+# =====================================================================
+# safe_filename_part
+# =====================================================================
+
+def test_safe_filename_part_nan_becomes_without_value():
+    assert clean_data.safe_filename_part(float("nan")) == "без_значения"
+
+
+def test_safe_filename_part_sanitizes_special_characters():
+    assert clean_data.safe_filename_part("A.B") == "A_B"
+
+
+# =====================================================================
+# CSV separator autodetection
+# =====================================================================
+
+@pytest.mark.parametrize("text,expected_sep", [
+    ("a;b;c\n1;2;3\n", ";"),
+    ("a,b,c\n1,2,3\n", ","),
+    ("a\tb\tc\n1\t2\t3\n", "\t"),
+])
+def test_detect_csv_separator(text, expected_sep):
+    assert clean_data.detect_csv_separator(text) == expected_sep
+
+
+def test_read_table_autodetects_semicolon(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_text("a;b\n1;2\n3;4\n", encoding="utf-8")
+    df = clean_data.read_table(str(path))
+    assert list(df.columns) == ["a", "b"]
+    assert len(df) == 2
+
+
+def test_read_table_autodetects_tab(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_text("a\tb\n1\t2\n", encoding="utf-8")
+    df = clean_data.read_table(str(path))
+    assert list(df.columns) == ["a", "b"]
+
+
+def test_read_table_sep_override(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_text("a|b\n1|2\n", encoding="utf-8")
+    df = clean_data.read_table(str(path), sep="|")
+    assert list(df.columns) == ["a", "b"]
+
+
+def test_cli_clean_out_sep_writes_custom_separator(tmp_path):
+    input_file = tmp_path / "in.csv"
+    input_file.write_text("a;b\n1;2\n", encoding="utf-8")
+    output = tmp_path / "out.csv"
+    result = run_cli(
+        "clean", str(input_file), "-o", str(output), "--dedup", "--out-sep", ";",
+    )
+    assert result.returncode == 0
+    content = output.read_text(encoding="utf-8-sig")
+    assert content.splitlines()[0] == "a;b"
+
+
+# =====================================================================
+# Порядок операций в clean
+# =====================================================================
+
+def test_cli_clean_dedup_runs_after_normalization(tmp_path):
+    """Дедупликация должна выполняться после trim/normalize — раньше
+    она шла первой и не ловила дубли, различавшиеся только пробелами
+    или форматом числа/даты."""
+    input_file = tmp_path / "in.csv"
+    input_file.write_text(
+        "id,name,amount\n"
+        "1, Иванов ,\"1 200,50\"\n"
+        "1,Иванов,1200.50\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "out.csv"
+    result = run_cli("clean", str(input_file), "-o", str(output), "--all")
+    assert result.returncode == 0
+    df = pd.read_csv(output, dtype=str)
+    assert len(df) == 1
+
+
+# =====================================================================
+# split: коллизии имён и NaN
+# =====================================================================
+
+def test_cli_split_nan_group_named_without_value(tmp_path):
+    input_file = tmp_path / "in.csv"
+    input_file.write_text("id,category\n1,A\n2,\n", encoding="utf-8")
+    out_dir = tmp_path / "split_out"
+    result = run_cli("split", str(input_file), "--by", "category", "-o", str(out_dir))
+    assert result.returncode == 0
+    files = sorted(p.name for p in out_dir.iterdir())
+    assert f"{input_file.stem}_без_значения.csv" in files
+
+
+def test_cli_split_filename_collision_gets_suffix(tmp_path):
+    input_file = tmp_path / "in.csv"
+    input_file.write_text("id,category\n1,A.B\n2,A_B\n3,C\n", encoding="utf-8")
+    out_dir = tmp_path / "split_out"
+    result = run_cli("split", str(input_file), "--by", "category", "-o", str(out_dir))
+    assert result.returncode == 0
+    files = sorted(p.name for p in out_dir.iterdir())
+    assert f"{input_file.stem}_A_B.csv" in files
+    assert f"{input_file.stem}_A_B_2.csv" in files
+
+
+# =====================================================================
+# Приведение чисел к числовому типу перед записью в xlsx/json
+# =====================================================================
+
+def test_cli_clean_xlsx_output_has_real_numeric_cells(tmp_path):
+    input_file = tmp_path / "in.csv"
+    input_file.write_text("id,amount\n1,\"1 200,50\"\n", encoding="utf-8")
+    output = tmp_path / "out.xlsx"
+    result = run_cli(
+        "clean", str(input_file), "-o", str(output),
+        "--normalize-numbers", "--number-columns", "amount",
+    )
+    assert result.returncode == 0
+    wb = openpyxl.load_workbook(output)
+    ws = wb.active
+    cell = ws.cell(row=2, column=2)
+    assert cell.data_type == "n"
+    assert cell.value == pytest.approx(1200.50)
+
+
+def test_cli_clean_json_output_has_real_numeric_values(tmp_path):
+    input_file = tmp_path / "in.csv"
+    input_file.write_text("id,amount\n1,\"2 500\"\n", encoding="utf-8")
+    output = tmp_path / "out.json"
+    result = run_cli(
+        "clean", str(input_file), "-o", str(output), "--normalize-numbers",
+    )
+    assert result.returncode == 0
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert isinstance(data[0]["amount"], (int, float))
+    assert data[0]["amount"] == 2500
+
+
+def test_cli_clean_csv_output_keeps_numbers_as_text(tmp_path):
+    """Для CSV числа остаются текстом (с точкой) — приведение к
+    числовому типу нужно только для xlsx/json."""
+    input_file = tmp_path / "in.csv"
+    input_file.write_text("id,amount\n1,\"1 200,50\"\n", encoding="utf-8")
+    output = tmp_path / "out.csv"
+    result = run_cli(
+        "clean", str(input_file), "-o", str(output),
+        "--normalize-numbers", "--number-columns", "amount",
+    )
+    assert result.returncode == 0
+    content = output.read_text(encoding="utf-8-sig")
+    assert "1200.50" in content
+
+
+# =====================================================================
+# read_table: xlsx с ошибками чтения
+# =====================================================================
+
+def test_read_table_corrupt_xlsx_fails_cleanly(tmp_path):
+    bad_file = tmp_path / "bad.xlsx"
+    bad_file.write_text("this is not a real xlsx file", encoding="utf-8")
+    result = run_cli("convert", str(bad_file), str(tmp_path / "out.csv"))
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Traceback" not in combined
+    assert "Ошибка" in combined
+
+
+# =====================================================================
+# sample_data/orders_export.xlsx — настоящие даты и числа
+# =====================================================================
+
+def test_sample_orders_export_has_real_date_and_number_cells():
+    path = PROJECT_ROOT / "sample_data" / "orders_export.xlsx"
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    header = [c.value for c in ws[1]]
+    date_col = header.index("Дата") + 1
+    amount_col = header.index("Сумма") + 1
+
+    date_cell = ws.cell(row=2, column=date_col)
+    amount_cell = ws.cell(row=2, column=amount_col)
+    assert date_cell.is_date
+    assert amount_cell.data_type == "n"
+
+
+def test_sample_orders_export_readable_and_cleanable(tmp_path):
+    path = PROJECT_ROOT / "sample_data" / "orders_export.xlsx"
+    output = tmp_path / "clean.csv"
+    result = run_cli("clean", str(path), "-o", str(output), "--all")
+    assert result.returncode == 0
+    assert "Traceback" not in (result.stdout + result.stderr)
 
 
 # =====================================================================
