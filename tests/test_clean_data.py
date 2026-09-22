@@ -142,6 +142,18 @@ def test_normalize_dates_datetime_with_time_supported():
     assert invalid == 0
 
 
+def test_normalize_dates_own_output_format_with_time_is_reparseable():
+    """Собственный выходной формат "ДД.ММ.ГГГГ ЧЧ:ММ:СС" должен
+    приниматься и на входе — иначе повторный normalize_dates на уже
+    нормализованной дате отмечает её как некорректную."""
+    df = pd.DataFrame({"date": ["05.03.2024 10:15:00"]})
+    result, changed, invalid, unsupported, columns = clean_data.normalize_dates(df, columns=["date"])
+    assert result["date"].iloc[0] == "05.03.2024 10:15:00"
+    assert changed == 0
+    assert invalid == 0
+    assert unsupported == 0
+
+
 def test_normalize_dates_invalid_date_unchanged_but_counted():
     df = pd.DataFrame({"date": ["31.02.2024"]})
     result, changed, invalid, unsupported, columns = clean_data.normalize_dates(df, columns=["date"])
@@ -244,6 +256,21 @@ def test_normalize_numbers_leading_zero_comma_is_not_ambiguous():
     result, changed, unrecognized, unsupported, columns = clean_data.normalize_numbers(df, columns=["amount"])
     assert unrecognized == 0
     assert changed == 1
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("1e-3", "0.001"),
+    ("2.5E+3", "2500"),
+])
+def test_normalize_numbers_scientific_notation(raw, expected):
+    """Экспоненциальная запись раньше портила величину: "1e-3" (без
+    точки в тексте) давало "0" из-за расчёта числа знаков после точки
+    по исходному тексту, а не по фактическому значению."""
+    df = pd.DataFrame({"amount": [raw]})
+    result, changed, unrecognized, unsupported, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    assert result["amount"].iloc[0] == expected
+    assert unrecognized == 0
+    assert unsupported == 0
 
 
 # =====================================================================

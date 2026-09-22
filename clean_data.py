@@ -252,6 +252,7 @@ DATE_FORMATS = [
     ("%d-%m-%Y", "%d.%m.%Y"),
     ("%d.%m.%y", "%d.%m.%Y"),
     ("%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M:%S"),
+    ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M:%S"),
 ]
 DATE_LIKE_PATTERN = re.compile(
     r"^\d{1,4}[./-]\d{1,2}[./-]\d{1,4}( \d{1,2}:\d{1,2}:\d{1,2})?$"
@@ -314,6 +315,7 @@ def normalize_dates(df, columns=None):
 NUMBER_LIKE_PATTERN = re.compile(r"^-?[\d\s.,]+$")
 CURRENCY_PATTERN = re.compile(r"[₽$€]|руб\.?", re.IGNORECASE)
 FORMATTING_MARKER_PATTERN = re.compile(r"[,\s₽$€-]")
+SCIENTIFIC_NOTATION_PATTERN = re.compile(r"^-?\d+(\.\d+)?[eE][+-]?\d+$")
 
 
 def detect_number_columns(df, exclude=None):
@@ -382,6 +384,14 @@ def normalize_numbers(df, columns=None, exclude=None):
         text = text.replace("\xa0", " ").replace(" ", "").strip()
         if not text:
             return value, False, False, True
+
+        if SCIENTIFIC_NOTATION_PATTERN.match(text):
+            try:
+                number = decimal.Decimal(text)
+            except decimal.InvalidOperation:
+                return value, False, False, True
+            formatted = format(number, "f")
+            return formatted, formatted != original, False, False
 
         has_comma = "," in text
         has_dot = "." in text
