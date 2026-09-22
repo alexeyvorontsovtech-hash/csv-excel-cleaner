@@ -87,6 +87,17 @@ def test_trim_whitespace_strips_and_counts():
     assert result["name"].iloc[1] == "Петров"
 
 
+def test_trim_whitespace_blank_string_becomes_nan():
+    """Строка из одних пробелов после обрезки становится "" — но dropna()
+    не считает "" пустым значением, поэтому такая "пустая" ячейка не
+    удаляется. Обрезка пустой после trim строки должна давать NaN."""
+    df = pd.DataFrame({"name": ["   ", "Иванов"]})
+    result, changed = clean_data.trim_whitespace(df)
+    assert pd.isna(result["name"].iloc[0])
+    assert result["name"].iloc[1] == "Иванов"
+    assert changed == 1
+
+
 def test_trim_whitespace_with_pandas_string_dtype():
     """Регрессионный тест: раньше trim_whitespace() пропускал столбцы,
     у которых dtype не равен object (например, pandas StringDtype или
@@ -109,7 +120,7 @@ def test_trim_whitespace_with_pandas_string_dtype():
 ])
 def test_normalize_dates_known_formats(raw, expected):
     df = pd.DataFrame({"date": [raw]})
-    result, changed, invalid, columns = clean_data.normalize_dates(df, columns=["date"])
+    result, changed, invalid, unsupported, columns = clean_data.normalize_dates(df, columns=["date"])
     assert result["date"].iloc[0] == expected
     assert columns == ["date"]
     assert invalid == 0
@@ -117,7 +128,7 @@ def test_normalize_dates_known_formats(raw, expected):
 
 def test_normalize_dates_non_date_value_unchanged():
     df = pd.DataFrame({"date": ["не дата"]})
-    result, changed, invalid, columns = clean_data.normalize_dates(df, columns=["date"])
+    result, changed, invalid, unsupported, columns = clean_data.normalize_dates(df, columns=["date"])
     assert result["date"].iloc[0] == "не дата"
     assert changed == 0
     assert invalid == 0
@@ -125,7 +136,7 @@ def test_normalize_dates_non_date_value_unchanged():
 
 def test_normalize_dates_datetime_with_time_supported():
     df = pd.DataFrame({"date": ["2024-03-06 10:15:00"]})
-    result, changed, invalid, columns = clean_data.normalize_dates(df, columns=["date"])
+    result, changed, invalid, unsupported, columns = clean_data.normalize_dates(df, columns=["date"])
     assert result["date"].iloc[0] == "06.03.2024 10:15:00"
     assert changed == 1
     assert invalid == 0
@@ -133,10 +144,21 @@ def test_normalize_dates_datetime_with_time_supported():
 
 def test_normalize_dates_invalid_date_unchanged_but_counted():
     df = pd.DataFrame({"date": ["31.02.2024"]})
-    result, changed, invalid, columns = clean_data.normalize_dates(df, columns=["date"])
+    result, changed, invalid, unsupported, columns = clean_data.normalize_dates(df, columns=["date"])
     assert result["date"].iloc[0] == "31.02.2024"
     assert changed == 0
     assert invalid == 1
+    assert unsupported == 0
+
+
+def test_normalize_dates_unsupported_format_counted_separately_from_invalid():
+    """"31.02.2024" похоже на дату по форме, но такого числа не бывает —
+    это "некорректная дата". "не дата" вообще не похоже на дату — это
+    "неподдерживаемый формат". Отчёт должен различать эти два случая."""
+    df = pd.DataFrame({"date": ["не дата", "31.02.2024"]})
+    result, changed, invalid, unsupported, columns = clean_data.normalize_dates(df, columns=["date"])
+    assert invalid == 1
+    assert unsupported == 1
 
 
 # =====================================================================
@@ -150,16 +172,27 @@ def test_normalize_dates_invalid_date_unchanged_but_counted():
 ])
 def test_normalize_numbers_known_formats(raw, expected):
     df = pd.DataFrame({"amount": [raw]})
-    result, changed, unrecognized, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    result, changed, unrecognized, unsupported, columns = clean_data.normalize_numbers(df, columns=["amount"])
     assert result["amount"].iloc[0] == expected
 
 
 def test_normalize_numbers_non_numeric_value_unchanged():
     df = pd.DataFrame({"amount": ["не число"]})
-    result, changed, unrecognized, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    result, changed, unrecognized, unsupported, columns = clean_data.normalize_numbers(df, columns=["amount"])
     assert result["amount"].iloc[0] == "не число"
     assert changed == 0
     assert unrecognized == 0
+    assert unsupported == 1
+
+
+def test_normalize_numbers_unsupported_format_counted_separately_from_invalid():
+    """"1,234" похоже на число, но неоднозначно (тысячи или десятичная
+    часть?) — это "некорректное число". "не число" вообще не похоже на
+    число — это "неподдерживаемый формат". Отчёт должен различать их."""
+    df = pd.DataFrame({"amount": ["не число", "1,234"]})
+    result, changed, unrecognized, unsupported, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    assert unrecognized == 1
+    assert unsupported == 1
 
 
 @pytest.mark.parametrize("raw,expected", [
@@ -170,14 +203,14 @@ def test_normalize_numbers_non_numeric_value_unchanged():
 ])
 def test_normalize_numbers_new_cases(raw, expected):
     df = pd.DataFrame({"amount": [raw]})
-    result, changed, unrecognized, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    result, changed, unrecognized, unsupported, columns = clean_data.normalize_numbers(df, columns=["amount"])
     assert result["amount"].iloc[0] == expected
     assert unrecognized == 0
 
 
 def test_normalize_numbers_does_not_round_to_two_decimals():
     df = pd.DataFrame({"amount": ["0,125"]})
-    result, changed, unrecognized, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    result, changed, unrecognized, unsupported, columns = clean_data.normalize_numbers(df, columns=["amount"])
     assert result["amount"].iloc[0] == "0.125"
 
 
@@ -186,17 +219,29 @@ def test_normalize_numbers_ambiguous_comma_is_not_changed():
     целой части — неоднозначный случай (тысячи или десятичная часть?).
     Значение не меняется, но учитывается в unrecognized_count."""
     df = pd.DataFrame({"amount": ["1,234"]})
-    result, changed, unrecognized, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    result, changed, unrecognized, unsupported, columns = clean_data.normalize_numbers(df, columns=["amount"])
     assert result["amount"].iloc[0] == "1,234"
     assert changed == 0
     assert unrecognized == 1
+    assert unsupported == 0
+
+
+def test_normalize_numbers_preserves_large_integer_precision():
+    """float не может точно представить целые числа больше 2**53;
+    normalize_numbers должен использовать decimal.Decimal, чтобы не
+    склеивать соседние большие числа в одно значение."""
+    df = pd.DataFrame({"amount": ["9 007 199 254 740 993", "9007199254740992"]})
+    result, changed, unrecognized, unsupported, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    assert result["amount"].iloc[0] == "9007199254740993"
+    assert result["amount"].iloc[1] == "9007199254740992"
+    assert result["amount"].iloc[0] != result["amount"].iloc[1]
 
 
 def test_normalize_numbers_leading_zero_comma_is_not_ambiguous():
     """"0,125" не может быть тысячами (0125 не бывает), поэтому это
     однозначно десятичная запятая, а не неоднозначный случай."""
     df = pd.DataFrame({"amount": ["0,125"]})
-    result, changed, unrecognized, columns = clean_data.normalize_numbers(df, columns=["amount"])
+    result, changed, unrecognized, unsupported, columns = clean_data.normalize_numbers(df, columns=["amount"])
     assert unrecognized == 0
     assert changed == 1
 
@@ -233,6 +278,32 @@ def test_safe_filename_part_sanitizes_special_characters():
 
 
 # =====================================================================
+# --all: столбцы дат не должны попадать в автообнаружение чисел
+# =====================================================================
+
+def test_cli_clean_all_excludes_date_columns_from_number_autodetection(tmp_path):
+    """Невалидная дата (31.02.2024) в столбце дат содержит дефис, который
+    без исключения провоцирует автообнаружение того же столбца как
+    числового и портит уже нормализованные даты (05.03.2024 -> 5032024)."""
+    input_file = tmp_path / "in.csv"
+    input_file.write_text(
+        "id,date\n"
+        "1,2024-03-05\n"
+        "2,2024-03-06\n"
+        "3,2024-02-31\n"
+        "4,2024-03-07\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "out.csv"
+    result = run_cli("clean", str(input_file), "-o", str(output), "--all")
+    assert result.returncode == 0
+    df = pd.read_csv(output, dtype=str)
+    assert list(df["date"]) == [
+        "05.03.2024", "06.03.2024", "2024-02-31", "07.03.2024",
+    ]
+
+
+# =====================================================================
 # CSV separator autodetection
 # =====================================================================
 
@@ -243,6 +314,44 @@ def test_safe_filename_part_sanitizes_special_characters():
 ])
 def test_detect_csv_separator(text, expected_sep):
     assert clean_data.detect_csv_separator(text) == expected_sep
+
+
+def test_detect_csv_separator_uses_field_count_not_char_frequency():
+    """";" встречается 3 раза (1 раз на строку), а "," — 4 раза, потому
+    что комментарий содержит запятые. Частотный подсчёт символов выбрал
+    бы ",", хотя реальный разделитель — ";" (по числу полей на строку)."""
+    text = (
+        "id;comment\n"
+        "1;товар,услуга,доставка\n"
+        "2;товар,услуга,доставка\n"
+    )
+    assert clean_data.detect_csv_separator(text) == ";"
+
+
+def test_read_table_keeps_full_structure_with_commas_inside_values(tmp_path):
+    path = tmp_path / "quoted.csv"
+    path.write_text(
+        "id;comment\n"
+        "1;товар,услуга,доставка\n"
+        "2;товар,услуга,доставка\n",
+        encoding="utf-8",
+    )
+    df = clean_data.read_table(str(path))
+    assert list(df.columns) == ["id", "comment"]
+    assert list(df["id"]) == ["1", "2"]
+    assert df["comment"].iloc[0] == "товар,услуга,доставка"
+
+
+def test_cli_convert_rejects_row_with_more_fields_than_header(tmp_path):
+    """Раньше pandas молча сдвигал лишнее поле в индекс: id=10, amount=50,
+    а исходный id "1" и последнее значение "50" терялись без предупреждения."""
+    input_file = tmp_path / "badrows.csv"
+    input_file.write_text("id,amount\n1,10,50\n", encoding="utf-8")
+    result = run_cli("convert", str(input_file), str(tmp_path / "out.json"), "--sep", ",")
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Traceback" not in combined
+    assert "Ошибка" in combined
 
 
 def test_read_table_autodetects_semicolon(tmp_path):
@@ -258,6 +367,24 @@ def test_read_table_autodetects_tab(tmp_path):
     path.write_text("a\tb\n1\t2\n", encoding="utf-8")
     df = clean_data.read_table(str(path))
     assert list(df.columns) == ["a", "b"]
+
+
+@pytest.mark.parametrize("marker", ["NA", "NULL", "N/A", "nan"])
+def test_read_table_keeps_na_like_strings_as_text(tmp_path, marker):
+    """"NA", "NULL", "N/A", "nan" — валидные текстовые значения
+    (например, артикул или код), а не признак пропуска."""
+    path = tmp_path / "data.csv"
+    path.write_text(f"code,name\n{marker},x\n", encoding="utf-8")
+    df = clean_data.read_table(str(path))
+    assert df["code"].iloc[0] == marker
+    assert not pd.isna(df["code"].iloc[0])
+
+
+def test_read_table_real_empty_cell_is_still_missing(tmp_path):
+    path = tmp_path / "data.csv"
+    path.write_text("code,name\n,x\n", encoding="utf-8")
+    df = clean_data.read_table(str(path))
+    assert pd.isna(df["code"].iloc[0])
 
 
 def test_read_table_sep_override(tmp_path):
@@ -326,6 +453,53 @@ def test_cli_split_filename_collision_gets_suffix(tmp_path):
     assert f"{input_file.stem}_A_B_2.csv" in files
 
 
+def test_cli_split_three_way_collision_keeps_all_groups(tmp_path):
+    """A/B и A_B оба нормализуются в "A_B", получая суффикс "_2". Если
+    третья группа изначально называется "A_B_2", она должна получить
+    свой собственный свободный суффикс, а не перезаписать вторую группу."""
+    input_file = tmp_path / "in.csv"
+    input_file.write_text(
+        "id,category\n1,A/B\n2,A_B\n3,A_B_2\n4,C\n", encoding="utf-8",
+    )
+    out_dir = tmp_path / "split_out"
+    result = run_cli("split", str(input_file), "--by", "category", "-o", str(out_dir))
+    assert result.returncode == 0
+    files = sorted(p.name for p in out_dir.iterdir())
+    stem = input_file.stem
+    assert len(files) == 4
+    assert f"{stem}_A_B.csv" in files
+    assert f"{stem}_A_B_2.csv" in files
+    assert f"{stem}_A_B_2_2.csv" in files
+    assert f"{stem}_C.csv" in files
+
+
+# =====================================================================
+# write_table: защита от инъекции формул в xlsx
+# =====================================================================
+
+@pytest.mark.parametrize("raw", ["=1+1", "+1+1", "-1+1", "@SUM(A1)"])
+def test_write_table_xlsx_escapes_formula_like_text(tmp_path, raw):
+    """Текстовое значение, начинающееся с =, +, -, @, должно записываться
+    как текст с префиксом апострофа (не как формула) — иначе комментарий
+    или название товара из CSV превращается в исполняемую формулу Excel."""
+    df = pd.DataFrame({"comment": [raw]})
+    output = tmp_path / "out.xlsx"
+    clean_data.write_table(df, str(output))
+    wb = openpyxl.load_workbook(output)
+    cell = wb.active["A2"]
+    assert cell.data_type != "f"
+    assert cell.value == f"'{raw}"
+
+
+def test_write_table_xlsx_does_not_escape_normal_text(tmp_path):
+    df = pd.DataFrame({"comment": ["обычный текст"]})
+    output = tmp_path / "out.xlsx"
+    clean_data.write_table(df, str(output))
+    wb = openpyxl.load_workbook(output)
+    cell = wb.active["A2"]
+    assert cell.value == "обычный текст"
+
+
 # =====================================================================
 # Приведение чисел к числовому типу перед записью в xlsx/json
 # =====================================================================
@@ -377,6 +551,45 @@ def test_cli_clean_csv_output_keeps_numbers_as_text(tmp_path):
 # =====================================================================
 # read_table: xlsx с ошибками чтения
 # =====================================================================
+
+def test_read_table_rejects_file_with_wrong_encoding(tmp_path):
+    """UTF-16-файл, прочитанный как utf-8 или cp1251, даёт мусорные
+    управляющие символы (NUL) вместо понятной ошибки — раньше это
+    завершалось кодом 0 с повреждёнными данными."""
+    bad_file = tmp_path / "encoding-utf-16.csv"
+    bad_file.write_bytes("id,name\n1,Иванов\n".encode("utf-16"))
+    result = run_cli("convert", str(bad_file), str(tmp_path / "out.json"))
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Traceback" not in combined
+    assert "кодировк" in combined.lower()
+
+
+def test_cli_convert_invalid_output_path_fails_cleanly(tmp_path):
+    """Путь вывода с несуществующим родителем-файлом (не каталогом)
+    должен давать понятную ошибку, а не FileExistsError с трейсбеком."""
+    input_file = tmp_path / "in.csv"
+    input_file.write_text("a;b\n1;2\n", encoding="utf-8")
+    bad_output = input_file / "out.csv"
+    result = run_cli("convert", str(input_file), str(bad_output))
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Traceback" not in combined
+    assert "Ошибка" in combined
+
+
+def test_cli_convert_invalid_out_sep_fails_cleanly(tmp_path):
+    """Многосимвольный --out-sep должен давать понятную ошибку, а не
+    TypeError из pandas с трейсбеком."""
+    input_file = tmp_path / "in.csv"
+    input_file.write_text("a;b\n1;2\n", encoding="utf-8")
+    output = tmp_path / "out.csv"
+    result = run_cli("convert", str(input_file), str(output), "--out-sep", "::")
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Traceback" not in combined
+    assert "Ошибка" in combined
+
 
 def test_read_table_corrupt_xlsx_fails_cleanly(tmp_path):
     bad_file = tmp_path / "bad.xlsx"

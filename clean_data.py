@@ -12,6 +12,8 @@ CSV/Excel файлов.
 """
 
 import argparse
+import csv
+import decimal
 import os
 import re
 import sys
@@ -27,21 +29,71 @@ CSV_SEPARATOR_CANDIDATES = [";", ",", "\t"]
 
 
 def detect_csv_separator(sample_text):
-    """Определяет разделитель CSV по образцу текста: сравнивает, какой
-    из кандидатов (';', ',', таб) встречается чаще в первых строках
-    файла. Запятая — разделитель по умолчанию, если ни один из
-    кандидатов не найден."""
-    first_lines = "\n".join(sample_text.splitlines()[:5])
-    counts = {sep: first_lines.count(sep) for sep in CSV_SEPARATOR_CANDIDATES}
-    best_sep = max(CSV_SEPARATOR_CANDIDATES, key=lambda s: counts[s])
-    if counts[best_sep] == 0:
+    """Определяет разделитель CSV по образцу текста: для каждого
+    кандидата (';', ',', таб) разбирает первые строки с учётом кавычек
+    и смотрит, сколько полей получается на строку. Выбирается кандидат,
+    дающий одинаковое (и большее одного) число полей на всех строках —
+    это надёжнее, чем просто частота символа, которую могут исказить
+    запятые внутри текстовых значений. Запятая — разделитель по
+    умолчанию, если ни один из кандидатов не подошёл."""
+    first_lines = [ln for ln in sample_text.splitlines()[:5] if ln != ""]
+    if not first_lines:
         return ","
-    return best_sep
+
+    best_sep = None
+    best_score = None
+    for sep in CSV_SEPARATOR_CANDIDATES:
+        try:
+            field_counts = [len(row) for row in csv.reader(first_lines, delimiter=sep)]
+        except csv.Error:
+            continue
+        if not field_counts or max(field_counts) <= 1:
+            continue
+        consistent = len(set(field_counts)) == 1
+        score = (consistent, field_counts[0])
+        if best_score is None or score > best_score:
+            best_score = score
+            best_sep = sep
+    return best_sep if best_sep is not None else ","
 
 
 def _read_csv_sample(path, encoding, size=4096):
     with open(path, "r", encoding=encoding, newline="") as f:
         return f.read(size)
+
+
+def _validate_csv_field_counts(path, encoding, sep):
+    """Проверяет, что каждая строка содержит столько же полей, сколько в
+    заголовке. Иначе pandas может молча сдвинуть лишнее поле в индекс
+    (или потерять его) вместо явной ошибки."""
+    with open(path, "r", encoding=encoding, newline="") as f:
+        rows = [row for row in csv.reader(f, delimiter=sep) if row != []]
+    if not rows:
+        return
+    header_len = len(rows[0])
+    for line_number, row in enumerate(rows[1:], start=2):
+        if len(row) != header_len:
+            sys.exit(
+                f"Ошибка: файл {path}, строка {line_number}: {len(row)} "
+                f"полей вместо {header_len} (как в заголовке). "
+                "Проверьте разделитель (--sep) и кавычки в значениях."
+            )
+
+
+BAD_ENCODING_RATIO_THRESHOLD = 0.01
+
+
+def _looks_like_wrong_encoding(text):
+    """Оценивает, похож ли декодированный текст на результат чтения в
+    неверной кодировке: считает долю replacement-символов (U+FFFD) и
+    управляющих символов (кроме обычных \\n, \\r, \\t)."""
+    if not text:
+        return False
+    bad = sum(
+        1 for ch in text
+        if ch == "�" or (ord(ch) < 32 and ch not in "\n\r\t")
+    )
+    return (bad / len(text)) > BAD_ENCODING_RATIO_THRESHOLD
 
 
 def read_table(path, sep=None):
@@ -59,11 +111,18 @@ def read_table(path, sep=None):
         if ext == ".csv":
             for encoding in ("utf-8", "cp1251"):
                 try:
+                    sample = _read_csv_sample(path, encoding)
+                    if _looks_like_wrong_encoding(sample):
+                        continue
                     used_sep = (
                         sep if sep is not None
-                        else detect_csv_separator(_read_csv_sample(path, encoding))
+                        else detect_csv_separator(sample)
                     )
-                    return pd.read_csv(path, dtype=str, sep=used_sep, encoding=encoding)
+                    _validate_csv_field_counts(path, encoding, used_sep)
+                    return pd.read_csv(
+                        path, dtype=str, sep=used_sep, encoding=encoding,
+                        keep_default_na=False, na_values=[""],
+                    )
                 except UnicodeDecodeError:
                     continue
             sys.exit(
@@ -72,7 +131,9 @@ def read_table(path, sep=None):
             )
         elif ext == ".xlsx":
             try:
-                return pd.read_excel(path, dtype=str)
+                return pd.read_excel(
+                    path, dtype=str, keep_default_na=False, na_values=[""],
+                )
             except Exception as e:
                 sys.exit(f"Ошибка: не удалось прочитать xlsx-файл {path}: {e}")
         else:
@@ -86,20 +147,45 @@ def read_table(path, sep=None):
         sys.exit(f"Ошибка: не удалось разобрать файл {path}: {e}")
 
 
+FORMULA_TRIGGER_CHARS = ("=", "+", "-", "@")
+
+
+def escape_formula_like_text(df):
+    """Экранирует текстовые значения, похожие на формулы Excel (начинаются
+    с =, +, - или @), префиксом апострофа — иначе Excel может исполнить их
+    как формулу вместо того, чтобы показать как исходный текст."""
+    df = df.copy()
+    for col in df.columns:
+        df[col] = df[col].apply(
+            lambda v: f"'{v}" if isinstance(v, str) and v.startswith(FORMULA_TRIGGER_CHARS) else v
+        )
+    return df
+
+
 def write_table(df, path, sep=","):
     """Сохраняет DataFrame в CSV, Excel или JSON — формат определяется
     по расширению файла в path. sep задаёт разделитель для CSV."""
     ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".csv" and len(sep) != 1:
+        sys.exit(
+            f"Ошибка: разделитель для вывода (--out-sep) должен быть "
+            f"ровно одним символом, получено: '{sep}'."
+        )
+
     out_dir = os.path.dirname(path)
     if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            sys.exit(f"Ошибка: не удалось создать каталог {out_dir}: {e}")
 
     try:
         if ext == ".csv":
             # utf-8-sig, чтобы кириллица корректно открывалась в Excel
             df.to_csv(path, index=False, encoding="utf-8-sig", sep=sep)
         elif ext == ".xlsx":
-            df.to_excel(path, index=False)
+            escape_formula_like_text(df).to_excel(path, index=False)
         elif ext == ".json":
             df.to_json(path, orient="records", force_ascii=False, indent=2)
         else:
@@ -137,13 +223,23 @@ def remove_empty_rows_and_columns(df):
     return df, removed_rows, removed_cols
 
 
+def _strip_value(v):
+    """Обрезает пробелы у строки; строка, ставшая пустой после
+    обрезки, считается пропуском (NaN), а не пустой строкой — иначе
+    dropna() не удаляет такие "пустые" ячейки."""
+    if not isinstance(v, str):
+        return v
+    stripped = v.strip()
+    return stripped if stripped else float("nan")
+
+
 def trim_whitespace(df):
     """Убирает пробелы в начале/конце значений текстовых полей."""
     df = df.copy()
     changed_count = 0
     for col in df.columns:
         original = df[col]
-        stripped = original.apply(lambda v: v.strip() if isinstance(v, str) else v)
+        stripped = original.apply(_strip_value)
         changed_count += int(((stripped != original) & original.notna()).sum())
         df[col] = stripped
     return df, changed_count
@@ -180,17 +276,20 @@ def normalize_dates(df, columns=None):
     (с временем — ДД.ММ.ГГГГ ЧЧ:ММ:СС, если время было в исходном
     значении). Понимает несколько распространённых форматов на входе.
 
-    Невалидные даты, похожие по форме на дату, но не существующие
-    (например, 31.02.2024), не изменяются, но считаются отдельно и
-    возвращаются в invalid_count."""
+    Значения, похожие по форме на дату, но не существующие (например,
+    31.02.2024), не изменяются и считаются в invalid_count —
+    "некорректная дата". Значения, вообще не похожие на дату ни в одном
+    из поддерживаемых форматов, считаются отдельно в unsupported_count —
+    "неподдерживаемый формат"."""
     df = df.copy()
     columns = columns if columns is not None else detect_date_columns(df)
     changed_count = 0
     invalid_count = 0
+    unsupported_count = 0
 
     def parse_one(value):
         if not isinstance(value, str) or not value.strip():
-            return value, False, False
+            return value, False, False, False
         text = value.strip()
         for in_fmt, out_fmt in DATE_FORMATS:
             try:
@@ -198,17 +297,18 @@ def normalize_dates(df, columns=None):
             except ValueError:
                 continue
             new_value = parsed.strftime(out_fmt)
-            return new_value, new_value != text, False
+            return new_value, new_value != text, False, False
         looks_like_date = bool(DATE_LIKE_PATTERN.match(text))
-        return value, False, looks_like_date
+        return value, False, looks_like_date, not looks_like_date
 
     for col in columns:
         results = df[col].apply(parse_one)
         df[col] = results.apply(lambda r: r[0])
         changed_count += int(results.apply(lambda r: r[1]).sum())
         invalid_count += int(results.apply(lambda r: r[2]).sum())
+        unsupported_count += int(results.apply(lambda r: r[3]).sum())
 
-    return df, changed_count, invalid_count, columns
+    return df, changed_count, invalid_count, unsupported_count, columns
 
 
 NUMBER_LIKE_PATTERN = re.compile(r"^-?[\d\s.,]+$")
@@ -216,15 +316,22 @@ CURRENCY_PATTERN = re.compile(r"[₽$€]|руб\.?", re.IGNORECASE)
 FORMATTING_MARKER_PATTERN = re.compile(r"[,\s₽$€-]")
 
 
-def detect_number_columns(df):
+def detect_number_columns(df, exclude=None):
     """Автоматически находит столбцы, похожие на числа с "грязным"
     форматированием (пробелы, запятые, символы валют, минус).
 
     Столбец берётся в работу только если в нём реально встречается
     признак "грязного" числа — иначе легко спутать, например, с ID
-    или уже нормализованной датой (там тоже только цифры и точки)."""
+    или уже нормализованной датой (там тоже только цифры и точки).
+
+    exclude — столбцы, которые не рассматриваются (например, уже
+    распознанные как даты — невалидная дата вида "31.02.2024" содержит
+    дефис и без исключения может провоцировать ложное срабатывание)."""
+    exclude = exclude or []
     detected = []
     for col in df.columns:
+        if col in exclude:
+            continue
         sample = df[col].dropna().astype(str).head(20)
         if sample.empty:
             continue
@@ -246,7 +353,7 @@ def detect_number_columns(df):
     return detected
 
 
-def normalize_numbers(df, columns=None):
+def normalize_numbers(df, columns=None, exclude=None):
     """Приводит числа к единому виду: убирает пробелы и символы валют,
     определяет десятичный разделитель и приводит его к точке. Не
     округляет — сохраняет исходную точность.
@@ -257,20 +364,24 @@ def normalize_numbers(df, columns=None):
     Если в числе только запятая и ровно три цифры после неё, а перед
     запятой не только "0" — это неоднозначный случай (может быть и
     разделитель тысяч, и десятичный разделитель): значение не
-    изменяется и учитывается в unrecognized_count."""
+    изменяется и учитывается в unrecognized_count — "некорректное
+    число". Значения, вообще не похожие на число (не удалось разобрать
+    после снятия форматирования), считаются отдельно в
+    unsupported_count — "неподдерживаемый формат"."""
     df = df.copy()
-    columns = columns if columns is not None else detect_number_columns(df)
+    columns = columns if columns is not None else detect_number_columns(df, exclude=exclude)
     changed_count = 0
     unrecognized_count = 0
+    unsupported_count = 0
 
     def parse_one(value):
         if not isinstance(value, str) or not value.strip():
-            return value, False, False
+            return value, False, False, False
         original = value.strip()
         text = CURRENCY_PATTERN.sub("", original)
         text = text.replace("\xa0", " ").replace(" ", "").strip()
         if not text:
-            return value, False, False
+            return value, False, False, True
 
         has_comma = "," in text
         has_dot = "." in text
@@ -289,28 +400,29 @@ def normalize_numbers(df, columns=None):
             else:
                 integer_part, _, fraction_part = text.partition(",")
                 if len(fraction_part) == 3 and integer_part.lstrip("-") not in ("", "0"):
-                    return value, False, True
+                    return value, False, True, False
                 text = text.replace(",", ".")
         elif has_dot:
             if text.count(".") > 1:
                 text = text.replace(".", "")
 
         try:
-            number = float(text)
-        except ValueError:
-            return value, False, False
+            number = decimal.Decimal(text)
+        except decimal.InvalidOperation:
+            return value, False, False, True
 
         decimals = len(text.split(".")[-1]) if "." in text else 0
         formatted = f"{number:.{decimals}f}"
-        return formatted, formatted != original, False
+        return formatted, formatted != original, False, False
 
     for col in columns:
         results = df[col].apply(parse_one)
         df[col] = results.apply(lambda r: r[0])
         changed_count += int(results.apply(lambda r: r[1]).sum())
         unrecognized_count += int(results.apply(lambda r: r[2]).sum())
+        unsupported_count += int(results.apply(lambda r: r[3]).sum())
 
-    return df, changed_count, unrecognized_count, columns
+    return df, changed_count, unrecognized_count, unsupported_count, columns
 
 
 NUMERIC_STRING_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")
@@ -390,6 +502,7 @@ def cmd_clean(args):
 
     report_lines = []
     number_columns_used = []
+    date_columns_used = []
 
     # Порядок важен: сначала приводим значения к единому виду
     # (пробелы, пустые строки, даты, числа) и только потом ищем
@@ -406,21 +519,24 @@ def cmd_clean(args):
 
     if args.normalize_dates or args.all:
         columns = parse_column_list(args.date_columns, df)
-        df, changed, invalid, used_columns = normalize_dates(df, columns)
+        df, changed, invalid, unsupported, used_columns = normalize_dates(df, columns)
+        date_columns_used = used_columns
         cols_text = ", ".join(used_columns) if used_columns else "не найдены"
         report_lines.append(
             f"Нормализовано дат: {changed} (столбцы: {cols_text}), "
-            f"некорректных дат: {invalid}"
+            f"некорректных дат: {invalid}, неподдерживаемый формат: {unsupported}"
         )
 
     if args.normalize_numbers or args.all:
         columns = parse_column_list(args.number_columns, df)
-        df, changed, unrecognized, used_columns = normalize_numbers(df, columns)
+        df, changed, unrecognized, unsupported, used_columns = normalize_numbers(
+            df, columns, exclude=date_columns_used
+        )
         number_columns_used = used_columns
         cols_text = ", ".join(used_columns) if used_columns else "не найдены"
         report_lines.append(
             f"Нормализовано чисел: {changed} (столбцы: {cols_text}), "
-            f"не распознано: {unrecognized}"
+            f"некорректных чисел: {unrecognized}, неподдерживаемый формат: {unsupported}"
         )
 
     if args.dedup or args.all:
@@ -463,12 +579,15 @@ def cmd_split(args):
     print(f"Входной файл: {args.input} ({len(df)} строк)")
     print(f"Разделение по столбцу: {args.by}")
 
-    used_stems = {}
+    used_final_stems = set()
     for value, group in df.groupby(args.by, dropna=False):
         stem = f"{base_name}_{safe_filename_part(value)}"
-        count = used_stems.get(stem, 0) + 1
-        used_stems[stem] = count
-        final_stem = stem if count == 1 else f"{stem}_{count}"
+        final_stem = stem
+        suffix = 2
+        while final_stem in used_final_stems:
+            final_stem = f"{stem}_{suffix}"
+            suffix += 1
+        used_final_stems.add(final_stem)
         out_path = os.path.join(args.output_dir, f"{final_stem}.{args.format}")
         write_table(group, out_path, sep=args.out_sep)
         print(f"- {value}: {len(group)} строк -> {out_path}")
